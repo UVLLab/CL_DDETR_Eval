@@ -110,22 +110,109 @@ def train_one_epoch(args, epo, model: torch.nn.Module, criterion: torch.nn.Modul
     return rehearsal_classes
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):
+def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
+                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
+                    device: torch.device, epoch: int, max_norm: float = 0):
+    model.train()
+    criterion.train()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    metric_logger.add_meter('grad_norm', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    print_freq = 10
+
+    prefetcher = data_prefetcher(data_loader, device, prefetch=True)
+    samples, targets = prefetcher.next()
+
+    # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+    for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
+        
+        # 여기서 적힌 samples는 전부 Nested Tensor 형태
+        outputs = model(samples)
+        loss_dict = criterion(outputs, targets)
+        weight_dict = criterion.weight_dict
+        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+
+        # reduce losses over all GPUs for logging purposes
+        loss_dict_reduced = utils.reduce_dict(loss_dict)
+        loss_dict_reduced_unscaled = {f'{k}_unscaled': v
+                                      for k, v in loss_dict_reduced.items()}
+        loss_dict_reduced_scaled = {k: v * weight_dict[k]
+                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
+        losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
+
+        loss_value = losses_reduced_scaled.item()
+
+        if not math.isfinite(loss_value):
+            print("Loss is {}, stopping training".format(loss_value))
+            print(loss_dict_reduced)
+            sys.exit(1)
+
+        optimizer.zero_grad()
+        losses.backward()
+        if max_norm > 0:
+            grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        else:
+            grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
+        optimizer.step()
+
+        metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
+        metric_logger.update(class_error=loss_dict_reduced['class_error'])
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        metric_logger.update(grad_norm=grad_total_norm)
+
+        samples, targets = prefetcher.next()
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+
+@torch.no_grad()
+def evaluate(model, teacher_model, criterion, postprocessors, data_loader, base_ds, device, output_dir, DIR) :
     model.eval()
     criterion.eval()
-    iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
-    coco_evaluator = CocoEvaluator(base_ds, iou_types)
+    teacher_model.eval()
+    
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    header = 'Test:'
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
+    coco_evaluator = CocoEvaluator(base_ds, iou_types, DIR)
+
+        
+    for samples, targets, _, _ in metric_logger.log_every(data_loader, 10, header):
+        # t_encoder_output_weight = []
+        # s_encoder_output_weight = []
+        # def t_hook_fn(module, input, output):
+        #     t_encoder_output_weight.append(output)
+            
+        # def s_hook_fn(module, input, output):
+        #     s_encoder_output_weight.append(output)
+            
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        # hook = teacher_model.transformer.encoder.register_forward_hook(t_hook_fn)
+        # hook_studnet = model.transformer.encoder.register_forward_hook(s_hook_fn)
+        
+        with torch.no_grad():
+            teacher_model(samples)
+            
         outputs = model(samples)
-        print('output', outputs)
+        # hook.remove()
+        # hook_studnet.remove()
+        # #encoder_output = model.transformer.memory
+        # distill_loss = torch.nn.functional.smooth_l1_loss(s_encoder_output_weight[0], t_encoder_output_weight[0].detach())
+        # distill_loss /= samples.shape[0]
+        
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
         # reduce losses over all GPUs for logging purposes
-        loss_dict_reduced = utils.reduce_dict(loss_dict)
+        loss_dict_reduced = utils.reduce_dict(loss_dict, True)
         loss_dict_reduced_scaled = {k: v * weight_dict[k]
                                     for k, v in loss_dict_reduced.items() if k in weight_dict}
         loss_dict_reduced_unscaled = {f'{k}_unscaled': v
@@ -137,44 +224,30 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         results = postprocessors['bbox'](outputs, orig_target_sizes)
+        #print(results)
+        if 'segm' in postprocessors.keys():
+            target_sizes = torch.stack([t["size"] for t in targets], dim=0)
+            results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
-        
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
-        if panoptic_evaluator is not None:
-            res_pano = postprocessors["panoptic"](outputs, target_sizes, orig_target_sizes)
-            for i, target in enumerate(targets):
-                image_id = target["image_id"].item()
-                file_name = f"{image_id:012d}.png"
-                res_pano[i]["image_id"] = image_id
-                res_pano[i]["file_name"] = file_name
-
-            panoptic_evaluator.update(res_pano)
-
     # gather the stats from all processes
-    #metric_logger.synchronize_between_processes()
+    metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     if coco_evaluator is not None:
         coco_evaluator.synchronize_between_processes()
-    if panoptic_evaluator is not None:
-        panoptic_evaluator.synchronize_between_processes()
 
     # accumulate predictions from all images
     if coco_evaluator is not None:
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
-    panoptic_res = None
-    if panoptic_evaluator is not None:
-        panoptic_res = panoptic_evaluator.summarize()
+
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     if coco_evaluator is not None:
         if 'bbox' in postprocessors.keys():
             stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
         if 'segm' in postprocessors.keys():
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
-    if panoptic_res is not None:
-        stats['PQ_all'] = panoptic_res["All"]
-        stats['PQ_th'] = panoptic_res["Things"]
-        stats['PQ_st'] = panoptic_res["Stuff"]
     return stats, coco_evaluator
+

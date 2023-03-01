@@ -10,9 +10,11 @@ import albumentations as A
 from util.box_ops import box_cxcywh_to_xyxy_resize, box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 from Custom_augmentation import CCB
 from torch.utils.data.sampler import SubsetRandomSampler
-
-def Incre_Dataset(Task_Num, args, Incre_Classes):    
-    current_classes = Incre_Classes[Task_Num]
+def Incre_Dataset(Task_Num, args, Incre_Classes, Train = True):    
+    if Train :
+        current_classes = Incre_Classes[Task_Num]
+    else:
+        current_classes = Incre_Classes
     print(f"current_classes : {current_classes}")
     
     if len(Incre_Classes) == 1:
@@ -22,7 +24,7 @@ def Incre_Dataset(Task_Num, args, Incre_Classes):
             dataset_train = build_dataset(image_set='train', args=args, class_ids=current_classes)
         else:
             dataset_train = build_dataset(image_set='train', args=args, class_ids=current_classes)
-    dataset_val = build_dataset(image_set='val', args=args)
+    dataset_val = build_dataset(image_set='val', args=args, class_ids=current_classes)
     
     if args.distributed:
         if args.cache_mode:
@@ -45,8 +47,10 @@ def Incre_Dataset(Task_Num, args, Incre_Classes):
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
                                  pin_memory=True)
-    
-    return dataset_train, data_loader_train, sampler_train, current_classes
+    if Train is True:
+        return dataset_train, data_loader_train, sampler_train, current_classes
+    else:
+        return dataset_val, data_loader_val, sampler_val, current_classes
 
 
 def DivideTask_for_incre(Task_Counts: int, Total_Classes: int, DivisionOfNames: Boolean):

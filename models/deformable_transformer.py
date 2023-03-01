@@ -44,7 +44,7 @@ class DeformableTransformer(nn.Module):
         self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
-
+        #self.memory = 0
         if two_stage:
             self.enc_output = nn.Linear(d_model, d_model)
             self.enc_output_norm = nn.LayerNorm(d_model)
@@ -150,8 +150,10 @@ class DeformableTransformer(nn.Module):
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
         # encoder
-        memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
-
+        memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten) #Encoder output 
+        
+        # for distillation
+        #self.memory = memory
         # prepare input for decoder
         bs, _, c = memory.shape
         if self.two_stage:
@@ -253,7 +255,7 @@ class DeformableTransformerEncoder(nn.Module):
         output = src
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         for _, layer in enumerate(self.layers):
-            output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask)
+            output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask) #encoder layer each
 
         return output
 

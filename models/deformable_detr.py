@@ -184,6 +184,7 @@ class DeformableDETR(nn.Module):
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
+        out['pred_logits']
         return out
 
     @torch.jit.unused
@@ -234,7 +235,7 @@ class SetCriterion(nn.Module):
                                             dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
-        target_classes_onehot = target_classes_onehot[:,:,:-1]
+        target_classes_onehot = target_classes_onehot[:,:,:-1] 
         loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
 
@@ -390,7 +391,6 @@ class SetCriterion(nn.Module):
 
         return losses
 
-
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
 
@@ -442,7 +442,7 @@ class MLP(nn.Module):
 
 
 def build(args):
-    num_classes = 60 if args.LG else 81
+    num_classes = 60 if args.LG else 91
     if args.dataset_file == "coco_panoptic":
         num_classes = 250
     device = torch.device(args.device)

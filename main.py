@@ -114,7 +114,7 @@ def get_args_parser():
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
     #parser.add_argument('--coco_path', default='/data/LG/real_dataset/total_dataset/didvepz/', type=str)
-    parser.add_argument('--coco_path', default='/data/COCODIR/', type=str)
+    parser.add_argument('--coco_path', default='/home/user/Desktop/vscode/cocodataset/', type=str)
     parser.add_argument('--file_name', default='./saved_rehearsal', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
@@ -124,18 +124,18 @@ def get_args_parser():
     parser.add_argument('--LG', default=False, action='store_true', help="for LG Dataset process")
     
     #* CL Setting 
-    parser.add_argument('--pretrained_model', default=None, help='resume from checkpoint')
+    parser.add_argument('--pretrained_model', default="/home/user/Desktop/vscode/CL_DDETR/CCBReplay(COCO_10Epoch_1K_NoFrozen)/cp_02_02_6.pth", help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',help='start epoch')
-    parser.add_argument('--start_task', default=1, type=int, metavar='N',help='start task')
-    parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--start_task', default=0, type=int, metavar='N',help='start task')
+    parser.add_argument('--eval', default=True, action='store_true')
     parser.add_argument('--verbose', default=False, action='store_true')
     parser.add_argument('--num_workers', default=16, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
 
     #* Continual Learning 
-    parser.add_argument('--Task', default=5, type=int, help='The task is the number that divides the entire dataset, like a domain.') #if Task is 1, so then you could use it for normal training.
+    parser.add_argument('--Task', default=2, type=int, help='The task is the number that divides the entire dataset, like a domain.') #if Task is 1, so then you could use it for normal training.
     parser.add_argument('--Task_Epochs', default=3, type=int, help='each Task epoch, e.g. 1 task is 5 of 10 epoch training.. ')
-    parser.add_argument('--Total_Classes', default=80, type=int, help='number of classes in custom COCODataset. e.g. COCO : 80 / LG : 59')
+    parser.add_argument('--Total_Classes', default=90, type=int, help='number of classes in custom COCODataset. e.g. COCO : 80 / LG : 59')
     parser.add_argument('--Total_Classes_Names', default=False, action='store_true', help="division of classes through class names (DID, PZ, VE). This option is available for LG Dataset")
     parser.add_argument('--CL_Limited', default=1000, type=int, help='Use Limited Training in CL. If you choose False, you may encounter data imbalance in training.')
 
@@ -180,7 +180,7 @@ def main(args):
                 break
         return out
     
-
+    teacher_model = model_without_ddp
     param_dicts = [
         {
             "params":
@@ -214,6 +214,8 @@ def main(args):
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
     output_dir = Path(args.output_dir)
     
+
+    
     print("Start training")
     start_time = time.time()
     file_name = args.file_name + "_" + str(0)
@@ -223,7 +225,22 @@ def main(args):
             args.Task = len(Divided_Classes)    
     start_epoch = 0
     start_task = 0
-    
+    DIR = './mAP_TEST.txt'
+    if args.eval:
+        expand_classes = []
+        for task_idx in range(int(args.Task)):
+            expand_classes.extend(Divided_Classes[task_idx])
+            print(f"trained task classes: {Divided_Classes[task_idx]}\t  we check all classes {expand_classes}")
+            dataset_val, data_loader_val, sampler_val, current_classes  = Incre_Dataset(task_idx, args, expand_classes, False)
+            #dataset_val, data_loader_val, sampler_val, current_classes  = Incre_Dataset(task_idx, args, Divided_Classes[-1], False)
+            base_ds = get_coco_api_from_dataset(dataset_val)
+            with open(DIR, 'a') as f:
+                f.write(f"NOW TASK num : {task_idx}, checked classes : {expand_classes} \t file_name : {str(args.pretrained_model)} \n")
+            test_stats, coco_evaluator = evaluate(model, teacher_model,  criterion, postprocessors,
+                                            data_loader_val, base_ds, device, args.output_dir, DIR)
+
+        return
+        
     if args.start_epoch != 0:
         start_epoch = args.start_epoch
     
@@ -248,7 +265,7 @@ def main(args):
         print(f"old class list : {load_replay}")
         
         #New task dataset
-        dataset_train, data_loader_train, sampler_train, list_CC = Incre_Dataset(task_idx, args, Divided_Classes) #rehearsal + New task dataset (rehearsal Dataset은 유지하도록 설정)
+        dataset_train, data_loader_train, sampler_train, list_CC = Incre_Dataset(task_idx, args, Divided_Classes, True) #rehearsal + New task dataset (rehearsal Dataset은 유지하도록 설정)
         MosaicBatch = False
         
         if task_idx >= 1 and args.Rehearsal:
@@ -273,7 +290,7 @@ def main(args):
             #original training
             #TODO: 매 에포크 마다 생성되는 save 파일과 지워지는 rehearsal 없도록 정리.
             rehearsal_classes = train_one_epoch( #save the rehearsal dataset. this method necessary need to clear dataset
-                args, epoch, model, criterion, data_loader_train, optimizer, device, MosaicBatch, list_CC, rehearsal_classes)
+                args, epoch, model, criterion, data_loader_train, optimizer, device, MosaicBatch, list_CC, rehearsal_classes, )
             lr_scheduler.step()
             #if epoch % 2 == 0:
             save_model_params(model_without_ddp, optimizer, lr_scheduler, args, args.output_dir, task_idx, int(args.Task), epoch)

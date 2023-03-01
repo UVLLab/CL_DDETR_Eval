@@ -138,6 +138,12 @@ def _origin_transform(image_set):
             #T.RandomResize([800], max_size=1333),
             normalize,
         ])
+        
+    if image_set == 'val':
+            return T.Compose([
+            T.RandomResize([608], max_size=1333),
+            normalize,
+        ])
 
 def make_coco_transforms(image_set):
 
@@ -203,8 +209,8 @@ def build(image_set, args, img_ids = None, class_ids = None):
     #     "val": (root / "images", root / 'output_json' / 'train.json'),
     # }
     PATHS = {
-        "train": (root / "train2017", root / 'annotations' / 'instances_train2017.json'),
-        "val": (root / "train2017", root / 'annotations' / 'instances_train2017.json'),
+        "train": (root / "val2017", root / 'instances_val2017.json'),
+        "val": (root / "val2017", root / 'instances_val2017.json'),
     }
 
     img_folder, ann_file = PATHS[image_set]
