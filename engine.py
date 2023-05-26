@@ -170,12 +170,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 
+# import custom_coco_evaluator
 @torch.no_grad()
-def evaluate(model, teacher_model, criterion, postprocessors, data_loader, base_ds, device, output_dir, DIR) :
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir, DIR):
     model.eval()
     criterion.eval()
-    teacher_model.eval()
-    
+
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Test:'
@@ -183,31 +183,18 @@ def evaluate(model, teacher_model, criterion, postprocessors, data_loader, base_
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
     coco_evaluator = CocoEvaluator(base_ds, iou_types, DIR)
 
+    panoptic_evaluator = None
+    if 'panoptic' in postprocessors.keys():
+        panoptic_evaluator = PanopticEvaluator(
+            data_loader.dataset.ann_file,
+            data_loader.dataset.ann_folder,
+            output_dir=os.path.join(output_dir, "panoptic_eval"),
+        )
         
     for samples, targets, _, _ in metric_logger.log_every(data_loader, 10, header):
-        # t_encoder_output_weight = []
-        # s_encoder_output_weight = []
-        # def t_hook_fn(module, input, output):
-        #     t_encoder_output_weight.append(output)
-            
-        # def s_hook_fn(module, input, output):
-        #     s_encoder_output_weight.append(output)
-            
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        # hook = teacher_model.transformer.encoder.register_forward_hook(t_hook_fn)
-        # hook_studnet = model.transformer.encoder.register_forward_hook(s_hook_fn)
-        
-        with torch.no_grad():
-            teacher_model(samples)
-            
-        outputs = model(samples)
-        # hook.remove()
-        # hook_studnet.remove()
-        # #encoder_output = model.transformer.memory
-        # distill_loss = torch.nn.functional.smooth_l1_loss(s_encoder_output_weight[0], t_encoder_output_weight[0].detach())
-        # distill_loss /= samples.shape[0]
-        
+        outputs = model(samples, 0)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
@@ -224,7 +211,6 @@ def evaluate(model, teacher_model, criterion, postprocessors, data_loader, base_
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         results = postprocessors['bbox'](outputs, orig_target_sizes)
-        #print(results)
         if 'segm' in postprocessors.keys():
             target_sizes = torch.stack([t["size"] for t in targets], dim=0)
             results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
@@ -232,22 +218,139 @@ def evaluate(model, teacher_model, criterion, postprocessors, data_loader, base_
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
+        if panoptic_evaluator is not None:
+            res_pano = postprocessors["panoptic"](outputs, target_sizes, orig_target_sizes)
+            for i, target in enumerate(targets):
+                image_id = target["image_id"].item()
+                file_name = f"{image_id:012d}.png"
+                res_pano[i]["image_id"] = image_id
+                res_pano[i]["file_name"] = file_name
+
+            panoptic_evaluator.update(res_pano)
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     if coco_evaluator is not None:
         coco_evaluator.synchronize_between_processes()
+    if panoptic_evaluator is not None:
+        panoptic_evaluator.synchronize_between_processes()
 
     # accumulate predictions from all images
     if coco_evaluator is not None:
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
-
+    panoptic_res = None
+    if panoptic_evaluator is not None:
+        panoptic_res = panoptic_evaluator.summarize()
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     if coco_evaluator is not None:
         if 'bbox' in postprocessors.keys():
             stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
         if 'segm' in postprocessors.keys():
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
+    if panoptic_res is not None:
+        stats['PQ_all'] = panoptic_res["All"]
+        stats['PQ_th'] = panoptic_res["Things"]
+        stats['PQ_st'] = panoptic_res["Stuff"]
     return stats, coco_evaluator
 
+
+
+
+@torch.no_grad()
+def save_evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir,  coco_path, checkpoint):
+    model.eval()
+    criterion.eval()
+    
+    # metric_logger = utils.MetricLogger(delimiter="  ")
+    # metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    # header = 'Test:'
+
+    # iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
+    # coco_evaluator = CocoEvaluator(base_ds, iou_types)
+    # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
+
+    #! if you save ve test image, you must this below path
+    # if save_type == "VE":
+    dir = coco_path + "/output_json/test.json"
+    img_dir = coco_path + "/images/"
+    coco = COCO(dir)
+    origin_img = img_dir
+    epoch = re.findall(r'\d+', checkpoint)[0]
+    #! if you use (did + ve) testdataset, you must use this below path 
+    # elif save_type == "TOTAL": 
+    #     coco = COCO("../testdataset/total_test/output_json/test.json")
+    #     origin_img = "../testdataset/total_test/images/"
+    
+    categories = coco.loadCats(coco.getCatIds())
+    name_list = [li['name'] for li in categories]
+    
+    #! confidence score threshold in COCO evaluation
+    threshold = 0.5
+    count = 0
+    for samples, targets in data_loader:
+        samples = samples.to(device)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        infrence_time = time.time()
+        outputs = model(samples)
+        output_time = time.time()
+        
+        print(f'inference time : {output_time - infrence_time}')
+        
+        #post processing
+        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+        results = postprocessors['save'](outputs, orig_target_sizes)
+        
+        #result processing
+        print_image = True
+        if print_image is True :
+            print("samples shape", samples.tensors[0].shape)
+            print(f"using device id : {torch.cuda.current_device()}")
+            for target, result in zip(targets, results):
+                scores = result["scores"][result["scores"] > threshold]
+                labels = result["labels"][result["scores"] > threshold] 
+                boxes = result["boxes"][result["scores"] > threshold] 
+                
+                image_id = target["image_id"].item()
+                img_info = coco.loadImgs(image_id)
+                
+                get_anns_info = coco.getAnnIds(image_id)
+                anns = coco.loadAnns(get_anns_info)
+                
+                img_dir = origin_img + img_info[0]['file_name']
+                
+                print(img_dir)
+                img1 = plt.imread(img_dir)
+                img2 = plt.imread(img_dir)
+            
+                plt.figure(figsize=(10,20))
+                plt.subplot(1, 2, 1)
+                plt.axis("off")
+                plt.title("predict")
+                
+                for box in boxes:
+                    cv2.rectangle(img1, (int(box[0].item()), int(box[1].item())), (int(box[2].item()), int(box[3].item())), (255, 0, 0), 3)
+            
+                for idx, label in enumerate(labels):
+                    plt.text(int(boxes[idx][0].item()), int(boxes[idx][1].item()), name_list[label - 1])
+
+                plt.imshow(img1)
+                                    
+                plt.subplot(1, 2, 2)
+                plt.axis("off")
+                plt.title("GT")
+                
+                plt.imshow(img2)
+                
+                coco.showAnns(anns, draw_bbox=True)
+                for idx, _ in enumerate(anns):
+                    plt.text(anns[idx]['bbox'][0], anns[idx]['bbox'][1], name_list[anns[idx]["category_id"] - 1])
+                
+                save_dir = coco_path + "/plt_img_" + epoch
+                if not os.path.exists(save_dir) : 
+                    os.mkdir(save_dir)
+                #! write your save path link.
+                plt.savefig(save_dir+ "/" + img_info[0]['file_name'])
+                plt.close()
+                #plt.show()

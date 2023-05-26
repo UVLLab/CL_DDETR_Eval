@@ -52,10 +52,12 @@ class DeformableDETR(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
+        self.class_embed2 = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.bbox_embed2 = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
         if not two_stage:
-            self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
+            self.query_embed = nn.Embedding(num_queries, hidden_dim*2) #300, 512 (Query만큼 embedding 개수, 하나의 쿼리에 응답하는 Dimension의 개수)
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
             input_proj_list = []
@@ -86,8 +88,11 @@ class DeformableDETR(nn.Module):
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         self.class_embed.bias.data = torch.ones(num_classes) * bias_value
+        self.class_embed2.bias.data = torch.ones(num_classes) * bias_value
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
+        nn.init.constant_(self.bbox_embed2.layers[-1].weight.data, 0)
+        nn.init.constant_(self.bbox_embed2.layers[-1].bias.data, 0)
         for proj in self.input_proj:
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
@@ -97,9 +102,12 @@ class DeformableDETR(nn.Module):
         if with_box_refine:
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
+            self.class_embed2 = _get_clones(self.class_embed2, num_pred)
+            self.bbox_embed2 = _get_clones(self.bbox_embed2, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
+            nn.init.constant_(self.bbox_embed2[0].layers[-1].bias.data[2:], -2.0)
             # hack implementation for iterative bounding box refinement
-            self.transformer.decoder.bbox_embed = self.bbox_embed
+            self.transformer.decoder.bbox_embed = self.bbox_embed #TODO : with box refinement 사용하려면 decoder에 들어가는 초기 설정값도 모두 변경해야 할 듯
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
@@ -111,7 +119,8 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
-    def forward(self, samples: NestedTensor):
+
+    def forward(self, samples: NestedTensor, task_information, pre_att=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -128,7 +137,7 @@ class DeformableDETR(nn.Module):
         """
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
-        features, pos = self.backbone(samples)
+        features, pos = self.backbone(samples) #! Fix
 
         srcs = []
         masks = []
@@ -154,7 +163,11 @@ class DeformableDETR(nn.Module):
         query_embeds = None
         if not self.two_stage:
             query_embeds = self.query_embed.weight
+        #    query_embeds = self.query_embed.weight[:150, :]
+        #    query_embeds_add = self.query_embed.weight[150:, :]
+            #TODO : Inference 시에 두 개의 Weight를 합쳐서 진행하는 작업이 필요할 듯 하다.
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds)
+
 
         outputs_classes = []
         outputs_coords = []
@@ -164,8 +177,13 @@ class DeformableDETR(nn.Module):
             else:
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
-            outputs_class = self.class_embed[lvl](hs[lvl])
-            tmp = self.bbox_embed[lvl](hs[lvl])
+            if task_information == 0:
+                outputs_class = self.class_embed[lvl](hs[lvl])
+                tmp = self.bbox_embed[lvl](hs[lvl])
+            elif task_information == 1:
+                outputs_class = self.class_embed2[lvl](hs[lvl])
+                tmp = self.bbox_embed2[lvl](hs[lvl])
+                
             if reference.shape[-1] == 4:
                 tmp += reference
             else:
@@ -184,7 +202,6 @@ class DeformableDETR(nn.Module):
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
-        out['pred_logits']
         return out
 
     @torch.jit.unused
@@ -235,7 +252,7 @@ class SetCriterion(nn.Module):
                                             dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
-        target_classes_onehot = target_classes_onehot[:,:,:-1] 
+        target_classes_onehot = target_classes_onehot[:,:,:-1]
         loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
 
@@ -390,6 +407,7 @@ class SetCriterion(nn.Module):
                 losses.update(l_dict)
 
         return losses
+
 
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""

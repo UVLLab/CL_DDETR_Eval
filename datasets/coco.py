@@ -149,8 +149,8 @@ def make_coco_transforms(image_set):
 
     normalize = T.Compose([
         T.ToTensor(),
-        #T.Normalize([0.312, 0.315, 0.294], [0.120, 0.122, 0.131]) # For LG
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])# third (11.14 ~ )
+        T.Normalize([0.312, 0.315, 0.294], [0.120, 0.122, 0.131]) # For LG
+        #T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])# third (11.14 ~ )
     ])
 
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, ]
@@ -201,7 +201,9 @@ def make_coco_transforms(image_set):
 
 
 def build(image_set, args, img_ids = None, class_ids = None):
+    print(f"class_ids : {class_ids}")
     root = Path(args.coco_path)
+    print(f"root : {root}")
     assert root.exists(), f'provided COCO path {root} does not exist'
     mode = 'instances'
     # PATHS = {
@@ -209,8 +211,8 @@ def build(image_set, args, img_ids = None, class_ids = None):
     #     "val": (root / "images", root / 'output_json' / 'train.json'),
     # }
     PATHS = {
-        "train": (root / "val2017", root / 'instances_val2017.json'),
-        "val": (root / "val2017", root / 'instances_val2017.json'),
+        "train": (root / "images", root / "output_json" / f'test.json'),
+        "val": (root / "images", root / "output_json" / f'test.json'),
     }
 
     img_folder, ann_file = PATHS[image_set]

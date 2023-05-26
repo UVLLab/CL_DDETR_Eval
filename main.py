@@ -24,7 +24,7 @@ import torch.distributed as dist
 from Custom_Dataset import *
 from custom_utils import *
 from custom_prints import *
-
+from glob import glob
 
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
@@ -114,7 +114,7 @@ def get_args_parser():
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
     #parser.add_argument('--coco_path', default='/data/LG/real_dataset/total_dataset/didvepz/', type=str)
-    parser.add_argument('--coco_path', default='/home/user/Desktop/vscode/cocodataset/', type=str)
+    # parser.add_argument('--coco_path', default='/home/user/Desktop/vscode/cocodataset/', type=str)
     parser.add_argument('--file_name', default='./saved_rehearsal', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
@@ -124,7 +124,8 @@ def get_args_parser():
     parser.add_argument('--LG', default=False, action='store_true', help="for LG Dataset process")
     
     #* CL Setting 
-    parser.add_argument('--pretrained_model', default="/home/user/Desktop/vscode/CL_DDETR/CCBReplay(COCO_10Epoch_1K_NoFrozen)/cp_02_02_6.pth", help='resume from checkpoint')
+    parser.add_argument('--pretrained_model', default="/home/user/Desktop/vscode/CL_DDETR/CCBReplay(COCO_10Epoch_1K_NoFrozen)/cp_02_02_6.pth",
+                        type=str, nargs='+', help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',help='start epoch')
     parser.add_argument('--start_task', default=0, type=int, metavar='N',help='start task')
     parser.add_argument('--eval', default=True, action='store_true')
@@ -135,7 +136,7 @@ def get_args_parser():
     #* Continual Learning 
     parser.add_argument('--Task', default=2, type=int, help='The task is the number that divides the entire dataset, like a domain.') #if Task is 1, so then you could use it for normal training.
     parser.add_argument('--Task_Epochs', default=3, type=int, help='each Task epoch, e.g. 1 task is 5 of 10 epoch training.. ')
-    parser.add_argument('--Total_Classes', default=90, type=int, help='number of classes in custom COCODataset. e.g. COCO : 80 / LG : 59')
+    parser.add_argument('--Total_Classes', default=59, type=int, help='number of classes in custom COCODataset. e.g. COCO : 80 / LG : 59')
     parser.add_argument('--Total_Classes_Names', default=False, action='store_true', help="division of classes through class names (DID, PZ, VE). This option is available for LG Dataset")
     parser.add_argument('--CL_Limited', default=1000, type=int, help='Use Limited Training in CL. If you choose False, you may encounter data imbalance in training.')
 
@@ -145,12 +146,18 @@ def get_args_parser():
     parser.add_argument('--Memory', default=500, type=int, help='memory capacity for rehearsal training')
     parser.add_argument('--Continual_Batch_size', default=4, type=int, help='continual batch training method')
     parser.add_argument('--Rehearsal_file', default='./Rehearsal_dict/', type=str)
+    
+    #control check version
+    parser.add_argument('--save', default=False, action='store_true', help ="save your model output image")
+    parser.add_argument('--coco_path', default='/newvetest/10test/', type=str, help="TOTAL : did+ve test (/testdataset/total_test)  | VE : ve test  (../testdataset)")
+    parser.add_argument('--all_data', default=False, action='store_true', help ="save your model output image")
     return parser
 
 def main(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
     
+    print(f"current rank : {utils.get_local_rank()}")
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
@@ -165,146 +172,61 @@ def main(args):
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
-    if args.pretrained_model is not None:
-        model = load_model_params(model, args.pretrained_model)
-    
-    model_without_ddp = model
-
-    #* collate_fn : 최종 출력시에 모든 배치값에 할당해주는 함수를 말함. 여기서는 Nested Tensor 호출을 의미함.
-    # lr_backbone_names = ["backbone.0", "backbone.neck", "input_proj", "transformer.encoder"]
-    def match_name_keywords(n, name_keywords):
-        out = False
-        for b in name_keywords:
-            if b in n:
-                out = True
-                break
-        return out
-    
-    teacher_model = model_without_ddp
-    param_dicts = [
-        {
-            "params":
-                [p for n, p in model_without_ddp.named_parameters()
-                 if not match_name_keywords(n, args.lr_backbone_names) and not match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
-            "lr": args.lr,
-        },
-        {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
-            "lr": args.lr * args.lr_linear_proj_mult,
-        },
-        {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
-            "lr": args.lr_backbone,
-        },
-    ]
-    if args.sgd:
-        optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
-                                    weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                      weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop, gamma = 0.5)
-
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
-
-    if args.frozen_weights is not None:
-        checkpoint = torch.load(args.frozen_weights, map_location='cpu')
-        model_without_ddp.detr.load_state_dict(checkpoint['model'])
-    output_dir = Path(args.output_dir)
-    
-
-    
-    print("Start training")
-    start_time = time.time()
-    file_name = args.file_name + "_" + str(0)
-    if args.Task != 1:
-        Divided_Classes = DivideTask_for_incre(args.Task, args.Total_Classes, args.Total_Classes_Names)
-        if args.Total_Classes_Names == True :
-            args.Task = len(Divided_Classes)    
-    start_epoch = 0
-    start_task = 0
-    DIR = './mAP_TEST.txt'
-    if args.eval:
-        expand_classes = []
-        for task_idx in range(int(args.Task)):
-            expand_classes.extend(Divided_Classes[task_idx])
-            print(f"trained task classes: {Divided_Classes[task_idx]}\t  we check all classes {expand_classes}")
-            dataset_val, data_loader_val, sampler_val, current_classes  = Incre_Dataset(task_idx, args, expand_classes, False)
-            #dataset_val, data_loader_val, sampler_val, current_classes  = Incre_Dataset(task_idx, args, Divided_Classes[-1], False)
-            base_ds = get_coco_api_from_dataset(dataset_val)
-            with open(DIR, 'a') as f:
-                f.write(f"NOW TASK num : {task_idx}, checked classes : {expand_classes} \t file_name : {str(args.pretrained_model)} \n")
-            test_stats, coco_evaluator = evaluate(model, teacher_model,  criterion, postprocessors,
-                                            data_loader_val, base_ds, device, args.output_dir, DIR)
-
-        return
+    print(f"test directory list : {len(args.pretrained_model)}")
+    for enum, predefined_model in enumerate(args.pretrained_model):
+        print(f"current predefined_model : {enum}, defined model name : {predefined_model}")
         
-    if args.start_epoch != 0:
-        start_epoch = args.start_epoch
-    
-    if args.start_task != 0:
-        start_task = args.start_task
+        if args.pretrained_model is not None:
+            model = load_model_params(model, predefined_model)
         
-    load_replay = []
-    for idx in range(start_task):
-        load_replay.extend(Divided_Classes[idx])
-    
-    #* Load for Replay
-    if args.Rehearsal and (start_task >= 1):
-        rehearsal_classes = multigpu_rehearsal(args.Rehearsal_file, args.Memory, 4, 0, 4, *load_replay) #TODO : 여기 설정 되는 거 변화하는 것도 중요할 듯
-        if len(rehearsal_classes)  == 0:
-            print(f"No rehearsal file")
-            rehearsal_classes = dict()
-    else:
-        rehearsal_classes = dict()
-                
-    #TODO : TASK 마다 훈련된 모델이 저장되게 설정해두기
-    for task_idx in range(start_task, args.Task):
-        print(f"old class list : {load_replay}")
-        
-        #New task dataset
-        dataset_train, data_loader_train, sampler_train, list_CC = Incre_Dataset(task_idx, args, Divided_Classes, True) #rehearsal + New task dataset (rehearsal Dataset은 유지하도록 설정)
-        MosaicBatch = False
-        
-        if task_idx >= 1 and args.Rehearsal:
-            if len(rehearsal_classes.keys()) < 5:
-                raise Exception("Too small rehearsal Dataset. Can't MosaicBatch Augmentation")
-            
-            check_components("replay", rehearsal_classes, args.verbose)
-            dataset_train, data_loader_train, sampler_train = CombineDataset(args, rehearsal_classes, dataset_train, args.num_workers, 
-                                                                             args.batch_size, old_classes=load_replay) #rehearsal + New task dataset (rehearsal Dataset은 유지하도록 설정)
-            if args.Mosaic == True:
-                MosaicBatch = True
+        model_without_ddp = model
+        if args.all_data == True:
+            dir_list = glob("/home/user/Desktop/vscode/newvetest/*")
+            dir_list.remove("/home/user/Desktop/vscode/newvetest/test_coco.txt")
+            # dir_list.remove("/home/user/Desktop/vscode/newvetest/10test")
+            # dir_list.remove("/home/user/Desktop/vscode/newvetest/2021")
+            # dir_list.remove("/home/user/Desktop/vscode/newvetest/multisingle")
+            # dir_list.remove("/home/user/Desktop/vscode/newvetest/")
         else:
-            print(f"no use rehearsal training method")
-        
-        
-        for epoch in range(start_epoch, args.Task_Epochs): #어차피 Task마다 훈련을 진행해야 하고, 중간점음 없을 것이므로 TASK마다 훈련이 되도록 만들어도 상관이 없음
-            if args.distributed:
-                sampler_train.set_epoch(epoch)#TODO: 추후에 epoch를 기준으로 batch sampler를 추출하는 행위 자체가 오류를 일으킬 가능성이 있음 Incremental Learning에서                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
-            print(f"task id : {task_idx}")
-            print(f"each epoch id : {epoch} , Dataset length : {len(dataset_train)}, current classes :{list_CC}")
+            dir_list = ["/home/user/Desktop/vscode"+ args.coco_path]
+        #* collate_fn : 최종 출력시에 모든 배치값에 할당해주는 함수를 말함. 여기서는 Nested Tensor 호출을 의미함.
 
-            #original training
-            #TODO: 매 에포크 마다 생성되는 save 파일과 지워지는 rehearsal 없도록 정리.
-            rehearsal_classes = train_one_epoch( #save the rehearsal dataset. this method necessary need to clear dataset
-                args, epoch, model, criterion, data_loader_train, optimizer, device, MosaicBatch, list_CC, rehearsal_classes, )
-            lr_scheduler.step()
-            #if epoch % 2 == 0:
-            save_model_params(model_without_ddp, optimizer, lr_scheduler, args, args.output_dir, task_idx, int(args.Task), epoch)
-            save_rehearsal(task_idx, args.Rehearsal_file, rehearsal_classes, epoch)
-            dist.barrier()
-            rehearsal_classes = multigpu_rehearsal(args.Rehearsal_file, args.Memory, 4, task_idx, epoch, *list_CC)
-            
-        save_model_params(model_without_ddp, optimizer, lr_scheduler, args, args.output_dir, task_idx, int(args.Task), -1)
-        load_replay.extend(Divided_Classes[task_idx])
+        print(f"check directory list : {dir_list}")
+        output_dir = Path(args.output_dir)
         
-        
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+        print("Start training")
+        start_time = time.time()
+        file_name = args.file_name + "_" + str(0)
+        if args.Task != 1:
+            Divided_Classes = DivideTask_for_incre(args.Task, args.Total_Classes, args.Total_Classes_Names)
+            if args.Total_Classes_Names == True :
+                args.Task = len(Divided_Classes)
+        DIR = './mAP_TEST.txt'
+        filename_list = ["didtest", "pztest", "VE2021", "VEmultisingle", "VE10test"]
+        if args.eval:
+            for task_idx, cur_file_name in enumerate(filename_list):
+                cur_file_name = filename_list[task_idx]
+                    
+                file_link = [name for name in dir_list if cur_file_name == os.path.basename(name)]
+                args.coco_path = file_link[0]
+                print(f"file name : {args.coco_path}")
+                if 'VE' in cur_file_name:
+                    task_idx = 2
+                    
+                print(f"trained task classes: {Divided_Classes[task_idx]}")
+                dataset_val, data_loader_val, _, _  = Incre_Dataset(task_idx, args, Divided_Classes[task_idx], False)
+                base_ds = get_coco_api_from_dataset(dataset_val)
+                
+                
+                with open(DIR, 'a') as f:
+                    f.write(f"----------------------------------------------------------------\n")
+                    f.write(f"NOW TASK num : {task_idx}, checked classes : {Divided_Classes[task_idx]} \t file_name : {str(predefined_model)} \n")
+                _, _ = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, DIR)
+            continue
+
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        print('Training time {}'.format(total_time_str))
 
     
 if __name__ == '__main__':

@@ -11,39 +11,38 @@ from util.box_ops import box_cxcywh_to_xyxy_resize, box_cxcywh_to_xyxy, box_xyxy
 from Custom_augmentation import CCB
 from torch.utils.data.sampler import SubsetRandomSampler
 def Incre_Dataset(Task_Num, args, Incre_Classes, Train = True):    
-    if Train :
-        current_classes = Incre_Classes[Task_Num]
-    else:
-        current_classes = Incre_Classes
+
+    current_classes = Incre_Classes
     print(f"current_classes : {current_classes}")
     
-    if len(Incre_Classes) == 1:
-        dataset_train = build_dataset(image_set='train', args=args, class_ids=None) #* Task ID에 해당하는 Class들만 Dataset을 통해서 불러옴
-    else: 
-        if Task_Num == 0 : #* First Task training
-            dataset_train = build_dataset(image_set='train', args=args, class_ids=current_classes)
-        else:
-            dataset_train = build_dataset(image_set='train', args=args, class_ids=current_classes)
+    if Train :
+        if len(Incre_Classes) == 1:
+            dataset_train = build_dataset(image_set='train', args=args, class_ids=None) #* Task ID에 해당하는 Class들만 Dataset을 통해서 불러옴
+        else: 
+            if Task_Num == 0 : #* First Task training
+                dataset_train = build_dataset(image_set='train', args=args, class_ids=current_classes)
+            else:
+                dataset_train = build_dataset(image_set='train', args=args, class_ids=current_classes)
     dataset_val = build_dataset(image_set='val', args=args, class_ids=current_classes)
     
     if args.distributed:
         if args.cache_mode:
-            sampler_train = samplers.NodeDistributedSampler(dataset_train)
+            # sampler_train = samplers.NodeDistributedSampler(dataset_train)
             sampler_val = samplers.NodeDistributedSampler(dataset_val, shuffle=False)
         else:
-            sampler_train = samplers.DistributedSampler(dataset_train)
+            # sampler_train = samplers.DistributedSampler(dataset_train)
             sampler_val = samplers.DistributedSampler(dataset_val, shuffle=True)
     else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        # sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
         
-    print(f"dataset config :{dataset_train}")
-    batch_sampler_train = torch.utils.data.BatchSampler(
-        sampler_train, args.batch_size, drop_last=True)
+    # print(f"dataset config :{dataset_train}")
+    # batch_sampler_train = torch.utils.data.BatchSampler(
+    #     sampler_train, args.batch_size, drop_last=True)
 
-    data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
-                                collate_fn=utils.collate_fn, num_workers=args.num_workers,
-                                pin_memory=True)
+    # data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
+    #                             collate_fn=utils.collate_fn, num_workers=args.num_workers,
+    #                             pin_memory=True)
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
                                  pin_memory=True)
@@ -64,8 +63,9 @@ def DivideTask_for_incre(Task_Counts: int, Total_Classes: int, DivisionOfNames: 
     if DivisionOfNames is True:
         Divided_Classes = []
         Divided_Classes.append([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]) #DID
-        Divided_Classes.append([28, 32, 35, 41, 56]) #photozone
-        Divided_Classes.append([22, 23, 24, 25, 26, 27, 29, 30, 31, 33,34,36, 37, 38, 39, 40,42,43,44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 57, 58, 59]) #VE
+        Divided_Classes.append([28, 32, 35, 41, 56]) #PZ , 
+        Divided_Classes.append([24, 27, 36, 42, 43, 48, 52]) #VE specific , 
+        #Divided_Classes.append([22, 23, 24, 25, 26, 27, 29, 30, 31, 33,34,36, 37, 38, 39, 40,42,43,44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 57, 58, 59]) #VE
         return Divided_Classes
     
     classes = [idx+1 for idx in range(Total_Classes)]
@@ -93,7 +93,7 @@ class CustomDataset(torch.utils.data.Dataset):
         self.re_dict = re_dict
         self.keys = list(self.re_dict.keys()) #image_id
         self.old_classes = old_classes
-        self.datasets = build_dataset(image_set='train', args=args, class_ids=self.old_classes, img_ids=self.keys)
+        self.datasets = build_dataset(image_set='val', args=args, class_ids=self.old_classes, img_ids=self.keys)
     
     def __len__(self):
         return len(self.datasets)
@@ -156,6 +156,7 @@ class BatchMosaicAug(torch.utils.data.Dataset):
         Rehearsal_index.insert(0, index)
 
         return random.sample(Rehearsal_index, len(Rehearsal_index))
+    
 #For Rehearsal
 def CombineDataset(args, RehearsalData, CurrentDataset, Worker, Batch_size, old_classes):
     OldDataset = CustomDataset(args, RehearsalData, old_classes) #oldDatset[idx]:
